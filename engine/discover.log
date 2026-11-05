@@ -1,0 +1,5 @@
+greenhouse: candidates=0 discovered=0 added=0 (was 86, now 86)
+ashby: candidates=0 discovered=0 added=0 (was 90, now 90)
+lever: candidates=0 discovered=0 added=0 (was 4, now 4)
+registry updated: {'ashby': 90, 'greenhouse': 86, 'lever': 4}
+{"error": {"code": "unsupported", "message": "unhandled args: ['discover-slugs', '--source', 'all']", "retryable": false, "param": null, "request_id": "req_local_4077812a980caad8", "source": "local"}}

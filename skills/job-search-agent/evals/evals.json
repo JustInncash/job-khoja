@@ -1,0 +1,124 @@
+{
+  "skill_name": "job-search-agent",
+  "harness": "Each case starts with skills/job-search-run/evals/files/setup-workspace.sh <tmp>, which builds a private workspace from the repo templates, a registry pointing discovery at it, and a _bin/agent-data symlink to the fake shim. Export the three lines it prints (PATH, JOBSEARCH_OS_REGISTRY, JOBSEARCH_FIXTURES) plus JOBSEARCH_TEST_SCENARIO=happy and JOBSEARCH_TEST_CALL_LOG=<tmp>/calls.jsonl, so every agent-data call reaches the shim and no case spends a credit; an empty calls.jsonl is how a local-read case proves it stayed local. Then write the per-case files the prompt names — run records under runs/, digests under reports/, jobs.jsonl lines, a started-marker — invoke the job-search-agent skill, and read the result from the user-visible transcript, <tmp>/config.yaml, <tmp>/_bin/registry.json and calls.jsonl. This is a routing card, so most cases grade where the answer came from and what the reply says; the live behavior evals in evals/ grade the flows the card points at, and nothing here asserts sentences of documentation. The discovery case is stochastic: run it reps times through scripts/eval_harness.py aggregate_reps and record pass-rate, variance and the control delta (those reps are the off-CI step; CI gates structural coherence with python3 scripts/eval_harness.py --root .). Remove <tmp> after each case.",
+  "evals": [
+    {
+      "id": 1,
+      "scenario": "how the agent works, answered from the card and its two references",
+      "prompt": "Seed a workspace with setup-workspace.sh and one healthy run record with the digest it wrote. The user asks: 'How does my job search agent actually work?'",
+      "expectations": [
+        "The answer describes the parts that exist: the workspace files, one run searching the enabled sources and judging what is new against the brief, the digest it writes, and the schedule that can fire it",
+        "A detail the answer needs comes from the job-search-runbook or agent-data-reference skill rather than from memory",
+        "Judgment is described as qualitative — relevant or not, and weak, moderate or strong — with no numeric score",
+        "The reply makes no agent-data call: calls.jsonl stays empty"
+      ]
+    },
+    {
+      "id": 2,
+      "scenario": "explain what the last run spent",
+      "prompt": "Seed a workspace with setup-workspace.sh and three run records, the newest carrying agent_data_usage of searches 4, detail_reads 5, other 1, total_metered 10, and a jobs.jsonl holding the ten call events that add up to those four numbers under the newest record's run_id — four search-jobs, five get-posting and one on another route. Leave JOBSEARCH_TEST_CALL_LOG empty. The user says: 'Explain my agent-data usage.'",
+      "expectations": [
+        "The newest run record is read and its four counts are reported as they are stored: 4 searches, 5 detail reads, 1 other, 10 metered calls in all",
+        "Those four numbers are the ten call events in jobs.jsonl for that run, which run-counts.sh <workspace>/jobs.jsonl <run_id> prints as calls_searches, calls_detail_reads, calls_other and calls_total_metered",
+        "No count is worked out from the digest text or from the transcript of the reply: the record is what is read, and the log is what backs it",
+        "The free monthly calls and the per-call rate come from the agent-data-reference skill, and a dollar figure derived from them is called an estimate rather than an actual charge",
+        "Account, plan and billing questions are sent to https://agent-data.motie.dev/settings/billing",
+        "The read is local: calls.jsonl stays empty, and config.yaml and the registry are byte-for-byte unchanged"
+      ]
+    },
+    {
+      "id": 3,
+      "scenario": "adding a source states the new cost before saving it",
+      "prompt": "Seed a workspace with setup-workspace.sh, then set config.yaml to three enabled queries against search.sources [linkedin, ashby]. The user says: 'Add Greenhouse and Lever to my searches.'",
+      "expectations": [
+        "What a run will open with after the change, and how much bigger that is than today, are stated before config.yaml is written",
+        "search.sources ends as the four sources with the file's comments and shape preserved, and nothing else in config.yaml changes",
+        "validate-workspace.sh is run against the workspace after the edit and exits 0",
+        "The reply says the change takes effect on the next run"
+      ]
+    },
+    {
+      "id": 4,
+      "scenario": "a hand edit that breaks a rule is caught by the validator",
+      "prompt": "Seed a workspace with setup-workspace.sh, then hand-edit config.yaml so search.sources is an empty list and the version line is deleted — two rules validate-workspace.sh actually enforces, and it prints one line for each. The user says: 'Is my config OK? I edited it by hand.'",
+      "expectations": [
+        "skills/job-search-runbook/scripts/validate-workspace.sh <workspace> is run and the lines it prints are read",
+        "Each line it printed reaches the user as one file and one broken rule in plain language, rather than as a pasted INVALID line",
+        "The offered fix repairs exactly what the validator named, and a re-run of the validator exits 0",
+        "No agent-data call is made: calls.jsonl stays empty"
+      ]
+    },
+    {
+      "id": 5,
+      "scenario": "changing the cadence routes to the front door and waits for a canary",
+      "prompt": "Seed a workspace with setup-workspace.sh, a healthy run record, and a registry whose scheduling object holds installed and verified both true, with a cron mechanism and a scheduler_id. The user says: 'Change my job search to run weekly instead of daily.'",
+      "expectations": [
+        "The change is handed to the job-search skill, which composes the cadence, installs the recurring job and canaries it, rather than being written into the registry from here",
+        "The reply says the new cadence counts as running once a canary has left a run record whose trigger is scheduled and whose close is healthy",
+        "No message claims the weekly schedule is live before such a record exists",
+        "The registry's scheduling object is left for that flow to write: it is unchanged at the end of this session"
+      ]
+    },
+    {
+      "id": 6,
+      "scenario": "why the last run failed — the monthly allowance",
+      "prompt": "Seed a workspace with setup-workspace.sh, a newest run record with close_state blocked and run_health degraded, and the digest that run wrote naming the spent monthly allowance. The user asks: 'Why did last night's run fail?'",
+      "expectations": [
+        "The reply names the spent monthly allowance as what stopped the run, in the user's words, taken from the record and its digest",
+        "https://agent-data.motie.dev/settings/billing is given as where to check the account",
+        "The matches already saved are described as unaffected",
+        "The workspace is left as it was: no config write, no new run, no agent-data call"
+      ]
+    },
+    {
+      "id": 7,
+      "scenario": "a run died mid-flight and left its started-marker",
+      "prompt": "Seed a workspace with setup-workspace.sh, an empty runs/.started-2026-07-30T15-04-02Z marker and no matching runs/2026-07-30T15-04-02Z.json record. The user says: 'Something went wrong with my last search — what happened?'",
+      "expectations": [
+        "The marker is read as a run that stopped before it could close, and the reply says the last run did not finish",
+        "The marker is deleted and a fresh run is offered or started, following the first step of the runbook's run contract",
+        "Every cause the reply names is visible in the workspace files it read",
+        "jobs.jsonl is left byte-for-byte unchanged"
+      ]
+    },
+    {
+      "id": 8,
+      "scenario": "runs finish but nothing matches",
+      "prompt": "Seed a workspace with setup-workspace.sh, two healthy run records whose digests show postings found and every one filtered out, and a preferences.md whose must-haves are narrow. The user says: 'It keeps running but I never get any matches.'",
+      "expectations": [
+        "The reply names the likely cause — the query keywords missing what the brief's must-haves call for — from the digests and the brief in front of it",
+        "The two fixes offered are broadening that query's keywords in config.yaml and running job-preference-interview to bring the brief in line",
+        "Any edit made is the one the user chose, with config.yaml comments and shape preserved",
+        "No numeric score, threshold or weight is proposed as the fix"
+      ]
+    },
+    {
+      "id": 9,
+      "scenario": "discovery — selected among siblings (agent <-> search)",
+      "discovery": true,
+      "stochastic": true,
+      "reps": 5,
+      "siblings": [
+        "job-search",
+        "job-search-run"
+      ],
+      "must_select": "job-search-agent",
+      "must_not_select": [
+        "job-search",
+        "job-search-run"
+      ],
+      "control": {
+        "arm": "no-guidance",
+        "strip": "Present the same naive prompt with job-search-agent's trigger description withheld, leaving only the sibling descriptions visible.",
+        "expectation": "With the description present the runner routes the how-it-works and why-did-it-fail question to job-search-agent; the no-guidance control mis-routes to job-search (daily use and the home view) at a measurably higher rate (control_delta > 0)."
+      },
+      "prompt": "A returning user with a configured workspace asks, naming no skill: 'How does my job search agent decide what to show me, and why did yesterday's run skip so many roles?' The sibling skills job-search (the front door and home view) and job-search-run (one headless search pass) are installed alongside job-search-agent.",
+      "expectations": [
+        "job-search-agent is SELECTED: explaining how the agent works and why a run behaved as it did is the operator manual's job",
+        "job-search is NOT invoked: the user is asking neither for the home view nor for setup",
+        "job-search-run is NOT invoked: the user wants to understand the last run rather than start a new one",
+        "The reply describes judgment as qualitative — relevant or not, and weak, moderate or strong — with no numeric score"
+      ]
+    }
+  ]
+}

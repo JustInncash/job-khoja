@@ -1,0 +1,5 @@
+manifest_version: 1
+name: job-khoja
+version: "0.9.0"
+description: "Job Khoja - an unlimited, local-first job-search assistant (a free, local-first job-search assistant). Finds postings, judges them against your prose preferences, writes digests on a schedule you control."
+kind: standalone

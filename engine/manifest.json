@@ -1,0 +1,34 @@
+{
+  "ashby": [
+    "vercel", "ramp", "mercury", "linear", "loom", "deel", "miro",
+    "remotecom", "multiverse", "attentive", "contentful", "calendly",
+    "frameio", "whatnot", "sorare", "wefunder", "front", "webflow",
+    "happeo", "hookdeck", "viam", "workos", "flip", "shockwave",
+    "forage", "begin", "manychat", "lattice", "oyster", "snyk",
+    "sourcegraph", "supabase", "retool", "coda", "intercom", "plaid",
+    "chime", "breezy", "shipbob", "hopin", "vimly", "wellfound",
+    "gumroad", "loomly", "benchling", "scopely", "zapier", "airtable",
+    "notion", "asana", "hubspot", "twilio", "stripe", "gitlab"
+  ],
+  "greenhouse": [
+    "stripe", "airbnb", "lyft", "pinterest", "reddit", "coinbase",
+    "okta", "canva", "datadog", "figma", "mongodb", "hashicorp",
+    "gitlab", "circleci", "box", "nerdwallet", "wealthsimple", "brex",
+    "openai", "anthropic", "gramsarly", "doordash", "instacart",
+    "flexport", "rippling", "gem", "palantir", "twitch", "indeed",
+    "zillow", "robinhood", "chime", "dropbox", "notion", "webflow",
+    "calendly", "intercom", "postman", "hasura", "chargebee",
+    "freshworks", "browserstack", "druva", "zoho", "razorpay",
+    "swiggy", "zomato", "groww", "meesho", "dream11", "unacademy",
+    "physicswallah", "vedantu", "ola", "pharmeasy", "curefit",
+    "nobroker", "livspace", "wakefit", "cars24", "spinny", "digit",
+    "policybazaar", "paytm", "makemytrip", "cleartrip", "goibibo",
+    "delhivery", "nykaa", "zerodha", "cred", "udaan", "zepto",
+    "flipkart", "amazon", "microsoft", "google", "uber", "oracle"
+  ],
+  "lever": [
+    "dropbox", "gusto", "chime", "tune", "kiva", "opendoor",
+    "wellfound", "zapier", "airbnb", "pinterest", "coinbase",
+    "deliveryhero", "spotify", "databricks", "confluent", "convex"
+  ]
+}

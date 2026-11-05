@@ -1,0 +1,34 @@
+{
+  "ashby": [
+    "deel", "miro", "oyster", "snyk", "supabase", "plaid", "benchling",
+    "zapier", "airtable", "notion", "workos", "manychat", "flip",
+    "attentive", "contentful", "happeo", "hookdeck", "viam", "wefunder",
+    "sorare", "multiverse", "begin", "forage", "lattice", "sourcegraph",
+    "retool", "coda", "intercom", "chime", "breezy", "shipbob", "hopin",
+    "gumroad", "scopely", "whatnot", "calendly", "webflow", "front",
+    "wiz", "inngest", "supaglue", "mux", "air", "charles", "comma",
+    "embl", "fastly", "framer", "huma", "kandji", "ledger", "oslash",
+    "pave", "pixie", "quill", "replit", "resend", "rownd", "shortcut",
+    "studio", "teleport", "tines", "uipath", "veed", "vercel"
+  ],
+  "greenhouse": [
+    "freshworks", "browserstack", "postman", "hasura", "chargebee",
+    "wise", "monzo", "revolut", "klarna", "n26", "better", "ro",
+    "teladoc", "hims", "zippia", "ziprecruiter", "eventbrite",
+    "squarespace", "twilio", "gusto", "elastic", "confluent", "databricks",
+    "sumo-logic", "splunk", "servicenow", "chegg", "thumbtack",
+    "glassdoor", "yelp", "etsy", "wayfair", "zillow", "match-group",
+    "expedia", "booking", "wix", "dropbox", "box", "slack", "atlassian",
+    "asana", "docusign", "roku", "nvidia", "amd", "qualcomm", "servicenow",
+    "nutanix", "vmware", "snowflake", "datadog", "new-relic", "sentry",
+    "launchdarkly", "vercel", "netlify", "cloudflare", "fastly", "dashlane",
+    "1password", "bitwarden", "duolingo", "codesignal", "hackerrank",
+    "interviewquery", "educative", "coursera", "udemy", "brightcove"
+  ],
+  "lever": [
+    "spotify", "duolingo", "codesignal", "digit", "draftkings", "etsy",
+    "appfolio", "upwork", "fiverr", "canva", "cultureamp", "perkbox",
+    "designlab", "hubspot", "grammarly", "honeybook", "wish", "stockx",
+    "grailed", "happycow", "crisp", "thinkific", "podia", "hey"
+  ]
+}

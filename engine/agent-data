@@ -1,0 +1,1619 @@
+#!/usr/bin/env python3
+"""agent-data-local — a free, keyless, unlimited drop-in replacement for the
+metered `agent-data` CLI used by the job-search plugin.
+
+Same CLI verbs and JSON envelopes as the real CLI, so the plugin's wrapper
+scripts (search-jobs.sh / fetch-posting.sh) and record-api-response.sh work
+unchanged. No API keys, no billing, no monthly cap.
+
+Sources (all free public endpoints):
+  ashby      https://api.ashbyhq.com/posting-api/job-board/{org}
+  greenhouse  https://boards-api.greenhouse.io/v1/boards/{org}/jobs
+  lever      https://api.lever.co/v0/postings/{org}?mode=json
+  remotive   https://remotive.com/api/remote-jobs
+  remoteok   https://remoteok.com/api
+  weworkremotely  https://weworkremotely.com/categories/remote-programming-jobs.rss
+
+Company boards come from sources.json in this directory (structure below).
+```
+{
+  "ashby": ["org-a", "org-b"],
+  "greenhouse": ["org-c"],
+  "lever": ["org-d"]
+}
+```
+"""
+
+import json
+import os
+import re
+import sys
+import time
+import csv
+import subprocess
+import urllib.parse
+import urllib.request
+import hashlib
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+
+VERSION = "1.0.0-local"
+LISTING = "f9a6ec16-0bfd-44d8-b3ee-073776745ee7"  # accepted; we ignore it anyway
+ROOT = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.environ.get(
+    "AGENT_DATA_LOCAL_DIR",
+    os.path.join(os.path.expanduser("~"), ".agent-data-local"),
+)
+CACHE_DIR = os.path.join(DATA_DIR, "cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+TIMEOUT = 25
+CACHE_TTL = 6 * 3600  # board dumps re-fetched every 6h max
+MIN_SLEEP = 0.35       # polite throttle between upstream requests
+
+
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+
+def _now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _req_id():
+    return "req_local_" + hashlib.sha1(
+        (str(time.time()) + os.urandom(4).hex()).encode()).hexdigest()[:16]
+
+
+def out(obj):
+    print(json.dumps(obj, ensure_ascii=False))
+    sys.exit(0)
+
+
+def err(code, message, retryable, param=None):
+    body = {"code": code, "message": message, "retryable": retryable,
+            "param": param, "request_id": _req_id(), "source": "local"}
+    print(json.dumps({"error": body}, ensure_ascii=False), file=sys.stderr)
+    sys.exit(1)
+
+
+def http_get(url, want_json=True, timeout=TIMEOUT):
+    req = urllib.request.Request(url, headers={"User-Agent": UA,
+                                               "Accept": "*/*"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read().decode("utf-8", "replace")
+    if want_json:
+        return json.loads(raw)
+    return raw
+
+
+def fetch_json(url):
+    """fetch with throttle; raise on any upstream problem"""
+    time.sleep(MIN_SLEEP)
+    return http_get(url)
+
+
+def cache_get(key, ttl=CACHE_TTL):
+    path = os.path.join(CACHE_DIR, hashlib.sha1(key.encode()).hexdigest() + ".json")
+    if os.path.exists(path):
+        if time.time() - os.path.getmtime(path) < ttl:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+    return None
+
+
+def cache_put(key, data):
+    path = os.path.join(CACHE_DIR, hashlib.sha1(key.encode()).hexdigest() + ".json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+
+
+def load_registry():
+    path = os.path.join(ROOT, "sources.json")
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def flag(argv, name):
+    if name in argv:
+        i = argv.index(name)
+        if i + 1 < len(argv):
+            return argv[i + 1]
+    return None
+
+
+# --------------------------------------------------------------------------
+# text helpers
+# --------------------------------------------------------------------------
+
+def _strip_html(s):
+    if not s:
+        return ""
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = re.sub(r"&nbsp;", " ", s)
+    s = re.sub(r"&amp;", "&", s)
+    s = re.sub(r"&lt;", "<", s)
+    s = re.sub(r"&gt;", ">", s)
+    s = re.sub(r"&#39;|&apos;", "'", s)
+    s = re.sub(r"&quot;", '"', s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+
+def _iso(txt):
+    """best-effort -> ISO string usable for ordering ('2026-08-01...')."""
+    if txt is None or txt == "":
+        return None
+    if isinstance(txt, (int, float)):
+        # epoch seconds or ms
+        try:
+            return datetime.fromtimestamp(txt / 1000 if txt > 1e11 else txt,
+                                         tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except Exception:
+            return None
+    txt = str(txt).strip()
+    m = re.match(r"(\d{4}-\d{2}-\d{2})", txt)
+    if not m:
+        return None
+    return m.group(1)
+
+
+def _eff_date(row):
+    vals = []
+    for v in (row.get("published_at"), row.get("posted_at")):
+        iso = _iso(v)
+        if iso:
+            vals.append(iso)
+    return max(vals)[:10] if vals else None
+
+
+# Domain synonym families used by the relaxed matcher. Query tokens expand
+# into these families, so "QA" matches "Quality Assurance Engineer".
+FAMILIES = {
+    "qa": {"qa", "quality"},
+    "test": {"test", "testing", "tester", "tests", "qe"},
+    "analyst": {"analyst"},
+    "engineer": {"engineer"},
+    "software": {"software"},
+    "automation": {"automation"},
+    "manual": {"manual"},
+    "junior": {"junior"},
+    "fresher": {"fresher", "entry", "graduate", "trainee"},
+    "sdet": {"sdet"},
+    "sql": {"sql"},
+    "java": {"java"},
+    "selenium": {"selenium"},
+    "remote": {"remote"},
+}
+QA_DOMAIN = {"qa", "quality", "test", "testing", "tester", "sdet",
+             "qe", "automation"}
+
+
+def _families(tokens):
+    fams = []
+    for t in tokens:
+        fam = FAMILIES.get(t, {t})
+        # merge into existing family set if overlapping
+        merged = False
+        for f in fams:
+            if f & fam:
+                f |= fam
+                merged = True
+                break
+        if not merged:
+            fams.append(set(fam))
+    return fams
+
+
+def _tokenize(text):
+    return [t for t in re.split(r"[^a-z0-9+#]+", text.lower()) if t]
+
+
+def _relative_date(txt, now=None):
+    """'3 days ago' / 'yesterday' / 'today' -> ISO date (UTC)."""
+    if not txt:
+        return None
+    now = now or datetime.now(timezone.utc)
+    t = txt.strip().lower()
+    if "today" in t or t in ("now", "just now"):
+        return now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    if "yesterday" in t:
+        return (now - datetime.timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    m = re.match(r"(\d+)\s*(day|week|month)s?\s*ago", t)
+    if not m:
+        return None
+    n = int(m.group(1)); unit = m.group(2)
+    days = n * {"day": 1, "week": 7, "month": 30}[unit]
+    return (now - datetime.timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _match_keywords(row, keyword_text):
+    """Relaxed full-text match with synonym families. A row matches when:
+    - every query family appears in the haystack, or
+    - at least half the families appear in the haystack AND at least one hits
+      the title, or
+    - the query is QA-domain and any QA-domain family hits the title.
+    """
+    if not keyword_text:
+        return True
+    toks = [t for t in re.split(r"[^a-z0-9+#]+", keyword_text.lower()) if t]
+    if not toks:
+        return True
+    # LinkedIn behaviour mirrors a board search: any keyword family matching
+    # the title OR company keeps the row (broader recall, judgment filters).
+    if row.get("source") == "linkedin":
+        title = str(row.get("title", "")).lower()
+        company = str(row.get("company_name", "")).lower()
+        fams = _families(toks)
+        return any(any(m in title or m in company for m in f) for f in fams)
+    hay = " ".join([
+        str(row.get("title", "")), str(row.get("company_name", "")),
+        str(row.get("location_display", "")),
+    ]).lower()
+    title = str(row.get("title", "")).lower()
+    fams = _families(toks)
+    in_hay = sum(1 for f in fams if any(m in hay for m in f))
+    in_title = any(any(m in title for m in f) for f in fams)
+    if in_hay >= len(fams):
+        return True
+    # A QA-domain query only short-circuits on a QA term actually present.
+    if any(t in QA_DOMAIN for t in toks):
+        qa_hit = any(
+            t in QA_DOMAIN and any(m in hay for m in FAMILIES.get(t, {t}))
+            for t in toks)
+        if qa_hit:
+            return True
+    return in_title and in_hay >= max(1, (len(fams) + 1) // 2)
+
+
+def _match_location(row, loc_text):
+    # A remote posting is compatible with any requested geography unless the
+    # user explicitly asked for a specific on-site place; remote always passes.
+    loc = str(row.get("location_display", "")).lower()
+    if "remote" in loc:
+        return True
+    if not loc_text:
+        return True
+    want = loc_text.lower()
+    if want in loc:
+        return True
+    # allow a word-level match for multi-word geographies (e.g. "Kolkata")
+    words = [w for w in re.split(r"[^a-z ]", want) if len(w) > 3]
+    if words and any(w in loc for w in words):
+        return True
+    return False
+
+
+def _match_freshness(row, cutoff):
+    if not cutoff:
+        return True
+    d = _eff_date(row)
+    return d is not None and d >= cutoff[:10]
+
+
+# --------------------------------------------------------------------------
+# source fetchers -> list of row dicts (already canonical-ish)
+# --------------------------------------------------------------------------
+
+def _canon(row, source, srcid, url, title, company, loc="", salary="",
+           etype="", dept="", team="", remote=None, wtype="",
+           posted="", published="", detail_available=True, tags=None, cat="",
+           org=""):
+    row.update({
+        "source": source, "source_id": srcid, "id": srcid, "source_url": url,
+        "title": title, "company_name": company, "location_display": loc,
+        "salary_display": salary, "employment_type": etype,
+        "department_name": dept, "team_name": team, "is_remote": remote,
+        "workplace_type": wtype, "posted_at": posted, "published_at": published,
+        "detail_available": detail_available,
+        "tags": tags or [], "category": cat, "_org": org,
+    })
+    return row
+
+
+def fetch_ashby(org):
+    url = f"https://api.ashbyhq.com/posting-api/job-board/{org}?includeCompensation=true"
+    data = fetch_json(url)
+    rows = []
+    for j in data.get("jobs", []) or []:
+        jid = j.get("id") or ""
+        loc = j.get("location") or ""
+        if not loc and j.get("address"):
+            loc = (j.get("address") or {}).get("addressLine") or ""
+        remote = bool(j.get("isRemote"))
+        if remote and not loc:
+            loc = "Remote"
+        comp = (j.get("compensation") or {}) or {}
+        sal = comp.get("compensationTierSummary") or comp.get("compensationDescription") or ""
+        desc = j.get("descriptionPlain") or _strip_html(j.get("descriptionHtml") or "")
+        rows.append(_canon(
+            {}, "ashby", str(jid), j.get("jobUrl") or "",
+            j.get("title") or "", org.replace("-", " ").title(),
+            str(loc), str(sal), str(j.get("employmentType") or ""),
+            str(j.get("department") or ""), str(j.get("team") or ""),
+            remote, "Remote" if remote else "", j.get("publishedAt") or "",
+            "", True, org=org,
+        ))
+        rows[-1]["_desc"] = desc
+    return rows
+
+
+def fetch_greenhouse(org):
+    rows = []
+    page = 1
+    url = (f"https://boards-api.greenhouse.io/v1/boards/{org}/jobs"
+           f"?content=true&per_page=100&page={page}")
+    while True:
+        data = fetch_json(url)
+        jobs = data.get("jobs") or []
+        for j in jobs:
+            jid = str(j.get("id") or "")
+            loc = ((j.get("location") or {}) or {}).get("name") or ""
+            meta = j.get("metadata") or []
+            etype = ""
+            for m in meta:
+                if str(m.get("name", "")).lower() in ("employment type", "employment_type"):
+                    etype = str(m.get("value") or "")
+                    break
+            dept = ""
+            depts = j.get("departments") or []
+            if depts:
+                dept = str(depts[0].get("name") or "")
+            office = ""
+            offices = j.get("offices") or []
+            if offices:
+                office = str(offices[0].get("name") or "")
+            rows.append(_canon(
+                {}, "greenhouse", jid, j.get("absolute_url") or "",
+                j.get("title") or "", str(j.get("company_name") or org.replace("-", " ").title()),
+                str(loc), "", etype, dept, office, None, "",
+                j.get("first_published") or "", j.get("updated_at") or "", True,
+                org=org,
+            ))
+            rows[-1]["_desc"] = _strip_html(j.get("content") or "")
+        if not data.get("next_page") or not jobs:
+            break
+        page += 1
+        url = (f"https://boards-api.greenhouse.io/v1/boards/{org}/jobs"
+               f"?content=true&per_page=100&page={page}")
+    return rows
+
+
+def fetch_lever(org):
+    url = f"https://api.lever.co/v0/postings/{org}?mode=json"
+    data = fetch_json(url)
+    rows = []
+    if not isinstance(data, list):
+        return rows
+    for j in data:
+        jid = str(j.get("id") or "")
+        cats = j.get("categories") or {}
+        loc = str(cats.get("location") or cats.get("allLocations") or "")
+        if isinstance(cats.get("allLocations"), list):
+            loc = "; ".join(str(x) for x in cats["allLocations"])
+        wtype = str(j.get("workplaceType") or "")
+        sr = j.get("salaryRange") or {}
+        sal = ""
+        if sr.get("min") or sr.get("max"):
+            sal = f"{sr.get('currency') or ''} {sr.get('min')} – {sr.get('max')} {sr.get('interval') or ''}".strip()
+        rows.append(_canon(
+            {}, "lever", jid, j.get("hostedUrl") or j.get("applyUrl") or "",
+            j.get("text") or "", org.replace("-", " ").title(),
+            loc, sal, str(cats.get("commitment") or ""),
+            str(cats.get("team") or ""), str(cats.get("department") or ""),
+            "remote" in wtype.lower(), wtype,
+            j.get("firstPublishedAt") or "", j.get("createdAt") or "", True,
+            org=org,
+        ))
+        rows[-1]["_desc"] = j.get("descriptionPlain") or ""
+    return rows
+
+
+def fetch_linkedin(keywords, location, limit=25):
+    """LinkedIn guest jobs search, adaptive-depth (mirrors agent-data's deep
+    crawl). Keeps paginating until the result set is exhausted (a page yields
+    no new cards) or MAX_LINKEDIN_PAGES pages are fetched (default 24 = 600
+    raw rows), or enough matching rows are collected. Fine to stop early."""
+    rows = []
+    max_pages = int(os.environ.get("MAX_LINKEDIN_PAGES", "60"))
+    target_rows = max(limit * 6, 50)  # collect enough before trimming to limit
+    start = 0
+    while start <= (max_pages - 1) * 25:
+        params = [("keywords", keywords)] if keywords else []
+        if location:
+            params.append(("location", location))
+        params.append(("start", str(start)))
+        qs = "&".join(f"{k}={urllib.parse.quote(str(v))}" for k, v in params)
+        url = f"https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search?{qs}"
+        try:
+            html = http_get(url, want_json=False)
+        except Exception:
+            break
+        cards = re.split(r'(?=<li>)', html)
+        got = 0
+        for card in cards:
+            if "base-card" not in card:
+                continue
+            mlink = re.search(r'jobs/view/[^"]*?(\d{6,})(?:[?&"]|$)', card)
+            mtitle = re.search(r'base-search-card__title">(.*?)</h3>', card, re.S)
+            mcomp = re.search(r'base-search-card__subtitle">(.*?)</h4>', card, re.S)
+            mloc = re.search(r'job-search-card__location">(.*?)</span>', card, re.S)
+            mdate = re.search(r'job-search-card__listdate[^>]*datetime="([^"]+)"', card)
+            rel = None
+            if not mdate:
+                mdate = re.search(r'job-search-card__listdate[^>]*>(.*?)</time>', card, re.S)
+                if mdate:
+                    rel = _strip_html(mdate.group(1))
+            if not mlink or not mtitle:
+                continue
+            jid = mlink.group(1)
+            title = _strip_html(mtitle.group(1))
+            company = _strip_html(mcomp.group(1)) if mcomp else ""
+            loc = _strip_html(mloc.group(1)) if mloc else ""
+            posted = ""
+            if mdate and mdate.group(1):
+                posted = mdate.group(1)
+            elif rel:
+                posted = _relative_date(rel) or ""
+            url_job = f"https://www.linkedin.com/jobs/view/{jid}"
+            rows.append(_canon(
+                {}, "linkedin", jid, url_job, title, company, loc,
+                "", "", "", "", None, "", posted, posted, True,
+            ))
+            got += 1
+        if got == 0:
+            break  # exhausted
+        if len(rows) >= target_rows:
+            break  # enough raw matches before hitting the page cap
+        start += 25
+        if start <= (max_pages - 1) * 25:
+            time.sleep(0.9)  # be polite to LinkedIn between pages
+    return rows
+
+
+def fetch_remotive(keywords):
+    # Remotive's ?search= param is ignored server-side; pull the software-dev
+    # category and let the local matcher do the keyword filtering.
+    url = "https://remotive.com/api/remote-jobs?category=software-dev&limit=100"
+    data = fetch_json(url)
+    rows = []
+    for j in data.get("jobs", []) or []:
+        jid = str(j.get("id") or "")
+        tags = [str(t) for t in (j.get("tags") or [])]
+        rows.append(_canon(
+            {}, "remotive", jid, j.get("url") or "",
+            j.get("title") or "", str(j.get("company_name") or ""),
+            str(j.get("candidate_required_location") or "Remote"),
+            str(j.get("salary") or ""), str(j.get("job_type") or ""),
+            str(j.get("category") or ""), "", None, "",
+            j.get("publication_date") or "", j.get("publication_date") or "", True,
+            tags, str(j.get("category") or ""),
+        ))
+    return rows
+
+
+def fetch_remoteok(keywords):
+    data = fetch_json("https://remoteok.com/api")
+    rows = []
+    if not isinstance(data, list):
+        return rows
+    for j in data[1:]:  # first element is a notice
+        jid = str(j.get("id") or "")
+        tags = [str(t) for t in (j.get("tags") or [])]
+        rows.append(_canon(
+            {}, "remoteok", jid, j.get("url") or j.get("apply_url") or "",
+            j.get("position") or "", str(j.get("company") or ""),
+            str(j.get("location") or "Remote"), str(j.get("salary_min") or ""),
+            "", "", "", None, "", j.get("date") or "", j.get("date") or "",
+            True, tags, "",
+        ))
+    return rows
+
+
+def fetch_weworkremotely(keywords):
+    raw = http_get(
+        "https://weworkremotely.com/categories/remote-programming-jobs.rss",
+        want_json=False)
+    # Safety: only parse feeds that carry no DTD/entity declarations (XXE /
+    # billion-laughs guard). The trusted RSS source never sends one.
+    if "<!DOCTYPE" in raw or "<!ENTITY" in raw:
+        return []
+    root = ET.fromstring(raw)
+    rows = []
+    for item in root.iter("item"):
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        desc = (item.findtext("description") or "").strip()
+        pub = (item.findtext("pubDate") or "").strip()
+        m = re.search(r"\d{4}-\d{2}-\d{2}", pub)
+        posted = m.group(0) if m else ""
+        company = ""
+        if ":" in title:
+            maybe_company, maybe_title = title.split(":", 1)
+            if maybe_company.strip() and maybe_title.strip():
+                company = maybe_company.strip()
+                title = maybe_title.strip()
+        hay = (title + " " + desc).lower()
+        rows.append(_canon(
+            {}, "weworkremotely",
+            hashlib.sha1(link.encode()).hexdigest()[:16], link, title, company,
+            "Remote", "", "", "", "", None, "", posted, posted, True, [], "",
+        ))
+    return rows
+
+
+FETCHERS = {
+    "linkedin": fetch_linkedin,
+    "ashby": fetch_ashby,
+    "greenhouse": fetch_greenhouse,
+    "lever": fetch_lever,
+    "remotive": fetch_remotive,
+    "remoteok": fetch_remoteok,
+    "weworkremotely": fetch_weworkremotely,
+}
+
+
+def fetch_source_rows(source, keywords, location, cutoff):
+    """returns (rows, error_or_None)"""
+    reg = load_registry()
+    if source.startswith("aa/"):
+        return fetch_via_api_anything(source, keywords, location, cutoff)
+    if source in ("ashby", "greenhouse", "lever"):
+        orgs = reg.get(source, [])
+        if not orgs:
+            return [], f"no {source} boards in registry (run probe-registry or add to sources.json)"
+        all_rows = []
+        for org in orgs:
+            key = f"{source}:{org}"
+            cached = cache_get(key)
+            if cached is None:
+                try:
+                    cached = FETCHERS[source](org)
+                except Exception as e:  # one board down != source down
+                    continue
+                cache_put(key, cached)
+            if isinstance(cached, list):
+                all_rows.extend(cached)
+        rows = all_rows
+    elif source == "linkedin":
+        try:
+            rows = FETCHERS[source](keywords, location, 25)
+        except Exception as e:
+            return [], f"linkedin upstream failed: {e}"
+    elif source == "remotive":
+        try:
+            rows = FETCHERS[source](keywords)
+        except Exception as e:
+            return [], f"remotive upstream failed: {e}"
+    elif source == "remoteok":
+        try:
+            rows = FETCHERS[source](keywords)
+        except Exception as e:
+            return [], f"remoteok upstream failed: {e}"
+    elif source == "weworkremotely":
+        try:
+            rows = FETCHERS[source](keywords)
+        except Exception as e:
+            return [], f"weworkremotely upstream failed: {e}"
+    else:
+        return [], f"Unsupported source {source!r}. Allowed: linkedin, ashby, greenhouse, lever, remotive, remoteok, weworkremotely, or aa/<site>/<op> (api-anything catalog)"
+
+    matched = []
+    for r in rows:
+        if not r.get("title") or not r.get("source_id") or not r.get("source_url"):
+            continue
+        if not _match_keywords(r, keywords):
+            continue
+        if not _match_location(r, location):
+            continue
+        if not _match_freshness(r, cutoff):
+            continue
+        matched.append(r)
+
+    matched.sort(key=lambda r: (_eff_date(r) or ""), reverse=True)
+    return matched, None
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def cmd_whoami():
+    out({"api_key_set": True, "api_key_source": "local-free",
+         "base_url": "local://agent-data-local"})
+
+
+def cmd_docs(listing):
+    docs = {
+        "listing_id": listing,
+        "routes": {
+            "search-jobs": {
+                "parameters": ["source", "keywords", "location", "limit",
+                               "published_on_or_after", "cursor"],
+                "response": {
+                    "data.query": {"source": "str", "keywords": "str",
+                                   "location": "str", "published_on_or_after": "str"},
+                    "data.results[]": {
+                        "source": "str", "source_id": "str", "id": "str",
+                        "source_url": "str", "title": "str", "company_name": "str",
+                        "location_display": "str", "salary_display": "str|null",
+                        "employment_type": "str", "department_name": "str",
+                        "team_name": "str", "is_remote": "bool|null",
+                        "workplace_type": "str", "posted_at": "str",
+                        "published_at": "str", "detail_available": "bool"},
+                    "data.pagination": {"next_cursor": "str|null", "has_more": "bool"},
+                },
+            },
+            "get-posting": {
+                "parameters": ["source", "posting_id", "source_url", "fields"],
+                "response": {
+                    "data.source": "str", "data.source_id": "str",
+                    "data.description_markdown": "str",
+                    "data.employment_type": "str", "data.apply_url": "str",
+                    "data.is_listed": "bool", "data.is_remote": "bool|null",
+                    "data.workplace_type": "str", "data.staleness_status": "str",
+                },
+            },
+        },
+    }
+    out(docs)
+
+
+def cmd_search(argv, listing):
+    source = flag(argv, "--source") or "linkedin"
+    if source not in FETCHERS and not source.startswith("aa/"):
+        err("validation_error", f"Unsupported source {source!r}. Allowed: "
+            + ", ".join(sorted(FETCHERS)) + ", or aa/<site>/<op>", False, param="source")
+    keywords = flag(argv, "--keywords") or ""
+    location = flag(argv, "--location") or ""
+    limit_s = flag(argv, "--limit") or "25"
+    try:
+        limit = int(limit_s)
+    except ValueError:
+        err("validation_error", "limit must be an integer", False, param="limit")
+    cutoff = flag(argv, "--published_on_or_after")
+    if cutoff is not None and not re.match(r"\d{4}-\d{2}-\d{2}", cutoff):
+        err("validation_error", "published_on_or_after must be YYYY-MM-DD",
+            False, param="published_on_or_after")
+
+    rows, ferr = fetch_source_rows(source, keywords, location, cutoff)
+    if ferr:
+        err("upstream_unavailable", ferr, True)
+
+    limited = rows[:limit]
+    # strip internal fields
+    clean = []
+    for r in limited:
+        out_row = {k: v for k, v in r.items() if k not in ("tags", "category", "_org")}
+        clean.append(out_row)
+
+    resp = {
+        "data": {
+            "query": {"source": source, "keywords": keywords,
+                      "location": location,
+                      "published_on_or_after": cutoff or None},
+            "results": clean,
+            "pagination": {"next_cursor": None, "has_more": False},
+        },
+        "meta": {"request_id": _req_id()},
+    }
+    out(resp)
+
+
+def find_row_in_cache(source, posting_id):
+    """recover the surfaced row by id from cached boards; returns row dict or None"""
+    if source == "linkedin":
+        return {"source": source, "source_id": posting_id, "id": posting_id,
+                "source_url": f"https://www.linkedin.com/jobs/view/{posting_id}",
+                "title": "", "company_name": "", "location_display": "",
+                "_org": ""}
+    if source.startswith("aa/"):
+        return {"source": source, "source_id": posting_id, "id": posting_id,
+                "source_url": source_url, "title": "", "company_name": "",
+                "location_display": "", "_org": ""}
+    reg = load_registry()
+    if source in ("ashby", "greenhouse", "lever"):
+        for org in reg.get(source, []):
+            cached = cache_get(f"{source}:{org}")
+            if not isinstance(cached, list):
+                continue
+            for r in cached:
+                if str(r.get("source_id")) == str(posting_id):
+                    return r
+    return None
+
+
+def cmd_get_posting(argv, listing):
+    source = flag(argv, "--source") or ""
+    posting_id = flag(argv, "--posting_id") or ""
+    source_url = flag(argv, "--source_url") or ""
+    if source not in FETCHERS:
+        err("validation_error", f"Unsupported source {source!r}", False, param="source")
+    if not posting_id or not source_url:
+        err("validation_error", "posting_id and source_url are required", False)
+
+    row = find_row_in_cache(source, posting_id)
+    if row is None:
+        # try to fetch live (fresh board) in case cache expired
+        try:
+            if source == "ashby":
+                reg = load_registry()
+                for org in reg.get("ashby", []):
+                    for r in fetch_ashby(org):
+                        if str(r.get("source_id")) == str(posting_id):
+                            row = r
+                            break
+                    if row:
+                        break
+            elif source == "greenhouse":
+                reg = load_registry()
+                for org in reg.get("greenhouse", []):
+                    for r in fetch_greenhouse(org):
+                        if str(r.get("source_id")) == str(posting_id):
+                            row = r
+                            break
+                    if row:
+                        break
+            elif source == "lever":
+                reg = load_registry()
+                for org in reg.get("lever", []):
+                    for r in fetch_lever(org):
+                        if str(r.get("source_id")) == str(posting_id):
+                            row = r
+                            break
+                    if row:
+                        break
+            elif source == "remotive":
+                for r in fetch_remotive(""):
+                    if str(r.get("source_id")) == str(posting_id):
+                        row = r
+                        break
+            elif source == "remoteok":
+                for r in fetch_remoteok(""):
+                    if str(r.get("source_id")) == str(posting_id):
+                        row = r
+                        break
+            elif source == "weworkremotely":
+                for r in fetch_weworkremotely(""):
+                    if str(r.get("source_id")) == str(posting_id):
+                        row = r
+                        break
+        except Exception:
+            pass
+
+    if row is None:
+        err("validation_error", "posting not found on this board set", False,
+            param="posting_id")
+
+    # full description per source
+    description = row.get("_desc") or ""
+    apply_url = row.get("source_url") or ""
+    etype = row.get("employment_type") or ""
+    remote = row.get("is_remote")
+    wtype = row.get("workplace_type") or ""
+    if not description:
+        # fallback: live per-job fetch, using the board org we recorded
+        org = row.get("_org") or ""
+        if not org:
+            m = re.search(r"boards\.greenhouse\.io/v1/boards/([^/]+)", source_url)
+            org = m.group(1) if m else ""
+        try:
+            if source == "ashby" and org:
+                data = fetch_json(
+                    f"https://api.ashbyhq.com/posting-api/job-board/{org}?includeCompensation=true")
+                for j in data.get("jobs", []) or []:
+                    if str(j.get("id")) == str(posting_id):
+                        description = j.get("descriptionPlain") or _strip_html(j.get("descriptionHtml") or "")
+                        apply_url = j.get("applyUrl") or j.get("jobUrl") or apply_url
+                        etype = etype or str(j.get("employmentType") or "")
+                        break
+            elif source == "greenhouse" and org:
+                d = fetch_json(f"https://boards-api.greenhouse.io/v1/boards/{org}/jobs/{posting_id}?questions=false")
+                description = d.get("content") or ""
+                apply_url = d.get("absolute_url") or apply_url
+            elif source == "lever" and org:
+                d = fetch_json(f"https://api.lever.co/v0/postings/{org}?mode=json")
+                for j in d:
+                    if str(j.get("id")) == str(posting_id):
+                        description = j.get("descriptionPlain") or ""
+                        apply_url = j.get("applyUrl") or j.get("hostedUrl") or apply_url
+                        break
+        except Exception:
+            pass
+    if not description:
+        try:
+            if source.startswith("aa/"):
+                rows, _ = fetch_via_api_anything(source, "", "", 300)
+                for r in rows:
+                    if str(r.get("source_id")) == str(posting_id):
+                        description = r.get("_desc") or ""
+                        apply_url = r.get("source_url") or apply_url
+                        break
+            elif source == "linkedin":
+                raw = http_get(f"https://www.linkedin.com/jobs-guest/jobs/view/{posting_id}",
+                               want_json=False)
+                m = re.search(r'show-more-less-html__markup[^>]*>(.*?)</div>',
+                              raw, re.S)
+                if m:
+                    description = _strip_html(m.group(1))
+            elif source == "remotive":
+                data = fetch_json("https://remotive.com/api/remote-jobs?limit=200")
+                for j in data.get("jobs", []) or []:
+                    if str(j.get("id")) == str(posting_id):
+                        description = j.get("description") or ""
+                        apply_url = j.get("url") or apply_url
+                        break
+            elif source == "remoteok":
+                try:
+                    data = fetch_json("https://remoteok.com/api")
+                except Exception:
+                    data = []
+                for j in data[1:]:
+                    if str(j.get("id")) == str(posting_id):
+                        description = j.get("description") or ""
+                        apply_url = j.get("url") or j.get("apply_url") or apply_url
+                        break
+            elif source == "weworkremotely":
+                raw = http_get(source_url, want_json=False)
+                m = re.search(r'<div class="job-description"[^>]*>(.*?)</div>', raw, re.S)
+                if m:
+                    description = _strip_html(m.group(1))
+        except Exception:
+            pass
+
+    resp = {
+        "data": {
+            "source": source,
+            "source_id": row.get("source_id"),
+            "description_markdown": description,
+            "employment_type": etype,
+            "apply_url": apply_url,
+            "is_listed": True,
+            "is_remote": remote,
+            "workplace_type": wtype,
+            "staleness_status": "fresh",
+        },
+        "meta": {"request_id": _req_id()},
+    }
+    out(resp)
+
+
+def cmd_probe_registry():
+    """agent-data probe-registry --manifest m.json --out sources.json
+    Tries each candidate (platform, org) against the public board APIs and keeps
+    only boards that answer. Writes the registry used by search."""
+    manifest_path = flag(sys.argv[2:], "--manifest") or os.path.join(ROOT, "manifest.json")
+    out_path = flag(sys.argv[2:], "--out") or os.path.join(ROOT, "sources.json")
+    with open(manifest_path, encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    registry = {"ashby": [], "greenhouse": [], "lever": []}
+    report = []
+    for platform, orgs in manifest.items():
+        for org in orgs:
+            try:
+                if platform == "ashby":
+                    url = f"https://api.ashbyhq.com/posting-api/job-board/{org}?includeCompensation=true"
+                    data = fetch_json(url)
+                    n = len(data.get("jobs", []) or [])
+                    if n >= 0:
+                        registry["ashby"].append(org)
+                        report.append(f"ashby {org}: {n} jobs")
+                elif platform == "greenhouse":
+                    url = f"https://boards-api.greenhouse.io/v1/boards/{org}/jobs?per_page=1"
+                    data = fetch_json(url)
+                    n = data.get("meta", {}).get("total", 0) if isinstance(data.get("meta"), dict) else len(data.get("jobs") or [])
+                    registry["greenhouse"].append(org)
+                    report.append(f"greenhouse {org}: {n} jobs")
+                elif platform == "lever":
+                    url = f"https://api.lever.co/v0/postings/{org}?mode=json&limit=1"
+                    data = fetch_json(url)
+                    if isinstance(data, list):
+                        n = len(data)
+                        registry["lever"].append(org)
+                        report.append(f"lever {org}: {n} jobs listed")
+            except Exception as e:
+                report.append(f"FAIL {platform} {org}: {e}")
+            time.sleep(0.15)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(registry, f, indent=2)
+    print("\n".join(report))
+    print(f"\nregistry written to {out_path}")
+    print(f"ashby={len(registry['ashby'])} greenhouse={len(registry['greenhouse'])} lever={len(registry['lever'])}")
+
+
+def _cdx_slugs(source, limit=8000):
+    """Enumerate board slugs from the Internet Archive CDX API (free, no key).
+    Mirrors the full-index crawl the metered service maintains."""
+    domains = {
+        "greenhouse": ("boards.greenhouse.io", "/jobs"),
+        "ashby": ("jobs.ashbyhq.com", ""),
+        "lever": ("jobs.lever.co", ""),
+    }
+    domain, needle = domains[source]
+    url = (f"http://web.archive.org/cdx/search/cdx?url={domain}/*"
+           f"&output=json&collapse=urlkey&fl=original"
+           f"&filter=statuscode:200&filter=original:.*{needle}.*"
+           f"&limit={limit}")
+    data = http_get(url, want_json=True)
+    slugs = set()
+    if isinstance(data, list) and len(data) > 1:
+        for row in data[1:]:
+            if not row:
+                continue
+            h = row[0] if isinstance(row, list) else str(row)
+            m = None
+            if source == "greenhouse":
+                m = re.search(r"boards\.greenhouse\.io/([^/?#]+)", h)
+            elif source == "ashby":
+                m = re.search(r"jobs\.ashbyhq\.com/([^/?#]+)", h)
+            else:
+                m = re.search(r"jobs\.lever\.co/([^/?#]+)", h)
+            if m:
+                slug = m.group(1).lower().strip()
+                if len(slug) >= 2 and not slug.isdigit():
+                    slugs.add(slug)
+    return sorted(slugs)
+
+
+def discover_slugs_for(source, max_pages=3):
+    """Harvest candidate company board slugs from the public web archive, then
+    verify each against the live board API. Mirrors how the metered service
+    builds a full ATS index — but free and local."""
+    patterns = {
+        "greenhouse": "site:boards.greenhouse.io/jobs",
+        "ashby": "site:jobs.ashbyhq.com",
+        "lever": "site:jobs.lever.co",
+    }
+    if source not in patterns:
+        return {"error": f"no discovery pattern for {source}"}
+    candidates = []
+    for attempt in range(3):
+        try:
+            candidates = _cdx_slugs(source)
+            break
+        except Exception as e:
+            if attempt == 2:
+                return {"error": f"cdx failed: {e}"}
+            time.sleep(2)
+    valid = []
+    for slug in candidates:
+        try:
+            FETCHERS[source](slug)
+            valid.append(slug)
+        except Exception:
+            continue
+    return {"candidates": len(candidates), "discovered": len(valid), "valid": valid}
+
+
+def cmd_discover_slugs():
+    src = flag(sys.argv[2:], "--source") or "all"
+    targets = [src] if src != "all" else ["greenhouse", "ashby", "lever"]
+    reg = load_registry()
+    for s in targets:
+        res = discover_slugs_for(s)
+        if "valid" not in res:
+            print(s, "->", res)
+            continue
+        before = len(reg.get(s, []))
+        added = [x for x in res["valid"] if x not in reg.get(s, [])]
+        reg.setdefault(s, []).extend(added)
+        reg[s] = sorted(set(reg[s]))
+        print(f"{s}: candidates={res['candidates']} discovered={res['discovered']} "
+              f"added={len(added)} (was {before}, now {len(reg[s])})")
+    path = os.path.join(ROOT, "sources.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(reg, f, indent=2)
+    print("registry updated:", {k: len(v) for k, v in reg.items()})
+
+
+# --------------------------------------------------------------------------
+# report — export-matches + apply-pack + enrichment (salary, company, repost)
+# --------------------------------------------------------------------------
+
+def _load_run_matches(ws, run_id):
+    """Read evaluated postings for a run; attach detail text when present."""
+    log = os.path.join(ws, "jobs.jsonl")
+    judged = []
+    details = {}
+    if os.path.exists(log):
+        with open(log, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                if o.get("run_id") != run_id:
+                    continue
+                if o.get("event") == "detail":
+                    details[(str(o.get("source")), str(o.get("source_id")))] = o
+                elif o.get("event") == "evaluated":
+                    judged.append(o)
+    return judged, details
+
+
+def _slugify(s):
+    s = re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
+    return s[:60] or "job"
+
+
+def normalize_salary(disp, text):
+    """Best-effort salary normalization. Returns a short canonical band string."""
+    joined = " ".join(x for x in (disp, (text or "")[:2500]) if x)
+    if not joined:
+        return ""
+    # Indian: ₹/Rs/INR with optional LPA/Lakh and a range
+    m = re.search(
+        r"(?:₹|Rs\.?|INR)\s*([\d,]+(?:\.[\d]+)?)\s*(?:-|–|to)"
+        r"\s*(?:₹|Rs\.?)?\s*([\d,]+(?:\.[\d]+)?)\s*(LPA|Lakh|Lacs?|per annum|p\.?a\.?|/year)?",
+        joined, re.I)
+    if m:
+        lo = float(m.group(1).replace(",", ""))
+        hi = float(m.group(2).replace(",", ""))
+        unit = (m.group(3) or "").lower()
+        if "l" in unit and "la" in unit or unit.startswith("l"):
+            lo, hi = lo, hi  # already lakh units
+            u = "LPA"
+        elif "per annum" in unit or "p.a" in unit or "/year" in unit:
+            u = "yr"
+        else:
+            # numbers like 4–8 without unit: treat as lakh if < 50
+            if hi <= 50 and lo >= 1:
+                u = "LPA"
+            else:
+                u = ""
+        return f"₹{lo:g}–{hi:g} {u}".replace("₹4–8 LPA" if False else " ", " ").strip()
+    m = re.search(
+        r"\$\s*([\d,]+(?:\.[\d]+)?)\s*(?:-|–|to)\s*(?:\$)?\s*([\d,]+(?:\.[\d]+)?)"
+        r"\s*(k|K|thousand)?\s*(per year|/yr|/year)?", joined)
+    if m:
+        lo = float(m.group(1).replace(",", ""))
+        hi = float(m.group(2).replace(",", ""))
+        k = m.group(3)
+        if k:
+            lo *= 1000; hi *= 1000
+        return f"${lo/1000:g}–{hi/1000:g}K/yr"
+    # single value fallback
+    m = re.search(r"(?:₹|Rs\.?|INR)\s*([\d,]+(?:\.[\d]+)?)\s*(LPA|Lakh|Lacs?)?", joined, re.I)
+    if m:
+        return f"₹{m.group(1)} {m.group(2) or ''}".strip()
+    return disp or ""
+
+
+def _company_registry():
+    reg = load_registry()
+    companies = []
+    for src, slugs in reg.items():
+        for s in slugs:
+            companies.append((src, s, re.sub(r"[-_]", " ", s)))
+    return companies
+
+
+def company_snapshot(company_name):
+    """Best-effort: careers URL from matched board slug + LinkedIn company link."""
+    name = re.sub(r"[^a-z0-9 ]", "", company_name.lower()).strip()
+    if not name:
+        return {"careers_url": "", "board": "", "linkedin_search": ""}
+    best = None
+    for src, slug, pretty in _company_registry():
+        if name == pretty or (name in pretty and len(name) >= 4):
+            best = (src, slug)
+            break
+    careers_url = ""
+    board = ""
+    if best:
+        src, slug = best
+        board = src
+        if src == "greenhouse":
+            careers_url = f"https://boards.greenhouse.io/{slug}"
+        elif src == "ashby":
+            careers_url = f"https://jobs.ashbyhq.com/{slug}"
+        elif src == "lever":
+            careers_url = f"https://jobs.lever.co/{slug}"
+    li = "https://www.linkedin.com/company/search?keywords=" + urllib.parse.quote(company_name)
+    return {"careers_url": careers_url, "board": board, "linkedin_search": li}
+
+
+def _repost_groups(judged):
+    """Group by normalized title+company; flag later duplicates as reposts."""
+    groups = {}
+    for o in judged:
+        key = hashlib.sha1(
+            (re.sub(r"\W+", " ", o.get("title", "")).strip().lower()
+             + "|" + re.sub(r"\W+", " ", o.get("company_name", "")).strip().lower())
+            .encode()).hexdigest()
+        groups.setdefault(key, []).append(o)
+    repost = {}
+    for key, items in groups.items():
+        if len(items) > 1:
+            first = items[0]["source_id"]
+            for o in items[1:]:
+                repost[str(o["source_id"])] = first
+    return repost
+
+
+def cmd_report():
+    ws = flag(sys.argv[2:], "--workspace") or os.path.join(os.path.expanduser("~"), ".job-search")
+    run_id = flag(sys.argv[2:], "--run-id") or ""
+    outdir = flag(sys.argv[2:], "--out") or os.path.join(ws, "reports", "matches")
+    os.makedirs(outdir, exist_ok=True)
+    if not run_id:
+        runs = sorted(d for d in os.listdir(os.path.join(ws, "runs")) if d.endswith(".json"))
+        if not runs:
+            err("usage", "no runs found; pass --run-id", False)
+        run_id = runs[-1][:-5]
+    judged, details = _load_run_matches(ws, run_id)
+    if not judged:
+        err("usage", f"no judged postings for run {run_id}", False)
+    repost = _repost_groups(judged)
+    rows = []
+    for o in judged:
+        sid = str(o.get("source_id"))
+        det = details.get((str(o.get("source")), sid), {})
+        desc = det.get("description_markdown") or ""
+        sal = normalize_salary(o.get("salary_display"), desc)
+        snap = company_snapshot(o.get("company_name", ""))
+        rows.append({
+            "run_id": run_id, "source": o.get("source"), "source_id": sid,
+            "title": o.get("title"), "company": o.get("company_name"),
+            "location": o.get("location_display"), "posted_at": o.get("posted_at", ""),
+            "relevant": o.get("relevant"), "match": o.get("match") or "",
+            "needs_human_check": o.get("needs_human_check") or False,
+            "salary": sal, "dealbreakers": "; ".join(o.get("dealbreakers_hit") or []),
+            "unknowns": "; ".join(o.get("unknowns") or []),
+            "reasoning": o.get("reasoning", ""), "url": o.get("source_url", ""),
+            "is_repost": str(sid) in repost, "repost_of": repost.get(str(sid), ""),
+            "careers_url": snap["careers_url"], "board": snap["board"],
+            "linkedin_search": snap["linkedin_search"],
+        })
+    # matches.csv
+    csv_path = os.path.join(outdir, "matches.csv")
+    cols = list(rows[0].keys())
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        w.writerows(rows)
+    # matches.xlsx when openpyxl is available
+    xlsx_path = ""
+    try:
+        import openpyxl
+        wb = openpyxl.Workbook()
+        wsx = wb.active
+        wsx.title = "matches"
+        wsx.append(cols)
+        for r in rows:
+            wsx.append([r[c] for c in cols])
+        xlsx_path = os.path.join(outdir, "matches.xlsx")
+        wb.save(xlsx_path)
+    except Exception:
+        xlsx_path = ""
+    # applications.csv tracker (append; never clobber)
+    app_path = os.path.join(ws, "reports", "applications.csv")
+    new = os.path.exists(app_path)
+    with open(app_path, "a", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        if not new:
+            w.writerow(["date_added", "source", "company", "title", "location",
+                        "match", "url", "status"])
+        for r in rows:
+            if r["relevant"] and r["match"] in ("strong", "moderate"):
+                w.writerow([time.strftime("%Y-%m-%d"), r["source"], r["company"],
+                            r["title"], r["location"], r["match"], r["url"], "applied_pending"])
+    # cover letters
+    letters_dir = os.path.join(outdir, "cover-letters")
+    os.makedirs(letters_dir, exist_ok=True)
+    brief = ""
+    bpath = os.path.join(ws, "preferences.md")
+    if os.path.exists(bpath):
+        with open(bpath, encoding="utf-8") as f:
+            brief = f.read()[:1600]
+    n_letters = 0
+    for r in rows:
+        if r["relevant"] and r["match"] in ("strong", "moderate"):
+            n_letters += 1
+            md = (f"# Cover letter — {r['company']}\n\n"
+                  f"**Role:** {r['title']} · {r['location']}\n"
+                  f"**Match:** {r['match']} · source: {r['source']}\n\n"
+                  f"**Why it fits (from your job-search agent):**\n{r['reasoning']}\n\n"
+                  f"**Apply:** {r['url']}\n"
+                  f"**Careers:** {r['careers_url'] or 'n/a'}\n\n"
+                  f"---\n\nDear Hiring Team,\n\n"
+                  f"Applying for {r['title']} at {r['company']}. As a QA Test Analyst fresher "
+                  f"(manual + automation, Selenium/Java, Postman, SQL, Jira; ISTQB CTFL in progress) "
+                  f"I bring what this role asks for. {r['reasoning']}\n\n"
+                  f"Best regards,\n{os.environ.get('JOBSEARCH_USER_NAME', 'Your Name')}\n{os.environ.get('JOBSEARCH_USER_EMAIL', 'you@example.com')}\n\n"
+                  f"--- Brief reference ---\n{brief}\n")
+            with open(os.path.join(letters_dir, _slugify(r["company"]) + ".md"),
+                      "w", encoding="utf-8") as f:
+                f.write(md)
+    print(f"report for run {run_id} → {outdir}")
+    print(f"  matches.csv: {len(rows)} rows")
+    if xlsx_path:
+        print(f"  matches.xlsx: written")
+    print(f"  applications.csv: appended ({n_letters} strong/moderate) ")
+    print(f"  cover-letters/: {n_letters} drafts")
+
+
+def _find_aa_cli():
+    """Locate the api-anything CLI: env override, PATH, or npm global."""
+    env = os.environ.get("API_ANYTHING_CLI")
+    if env and os.path.exists(env):
+        return env
+    exe = shutil.which("api-anything")
+    if exe:
+        return exe
+    try:
+        root = subprocess.run(["npm", "root", "-g"], capture_output=True,
+                              text=True, timeout=15).stdout.strip()
+        if root:
+            cand = os.path.join(root, "api-anything", "dist", "cli.js")
+            if os.path.exists(cand):
+                return cand
+    except Exception:
+        pass
+    return ""
+
+
+AA_CLI = _find_aa_cli()
+
+
+def api_anything_call(site, op, params):
+    """Call api-anything CLI: `node cli.js call <site> <op> k=v ...`.
+    Returns the parsed JSON (ok/class/data/...)."""
+    cmd = ["node", AA_CLI, "call", site, op]
+    for k, v in params.items():
+        if v is not None and str(v) != "":
+            cmd.append(f"{k}={v}")
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+    if p.returncode != 0:
+        return {"ok": False, "class": "cli", "reason": (p.stderr or p.stdout)[:300]}
+    try:
+        return json.loads(p.stdout)
+    except Exception as e:
+        return {"ok": False, "class": "parse", "reason": str(e)}
+
+
+def _aa_item_to_row(item, site, op, keywords, location):
+    """Heuristic mapping of a catalog item to a canonical job row."""
+    def pick(*keys):
+        for k in keys:
+            v = item.get(k)
+            if isinstance(v, dict):
+                v = v.get("name") or v.get("title") or v.get("displayName")
+            if v:
+                return str(v)
+        return ""
+    title = pick("title", "jobTitle", "name", "role", "text", "position")
+    company = pick("company", "companyName", "organization", "employer", "org", "disambiguatingDescription")
+    loc = pick("location", "locationName", "city", "place", "locations", "office")
+    if not loc and not isinstance(item.get("description"), (list, dict)) \
+            and len(str(item.get("description") or "")) < 80 \
+            and site == "linkedin":
+        loc = str(item.get("description") or "")
+    if isinstance(item.get("locations"), list):
+        loc = "; ".join(str(x.get("name") or x) for x in item["locations"][:3])
+    # Naukri-style payload: placeholders[] carries experience/salary/location
+    placeholders = item.get("placeholders") or []
+    if isinstance(placeholders, list):
+        for ph in placeholders:
+            label = str(ph.get("label") or "")
+            ptype = str(ph.get("type") or "").lower()
+            if ptype == "location" and not loc:
+                loc = label
+            elif ptype == "salary" and not sal_placeholder:
+                sal_placeholder = label
+    url = pick("url", "applyUrl", "permalink", "link", "absolute_url", "hostedUrl", "jobUrl", "jdURL")
+    if url.startswith("/"):
+        url = "https://www.naukri.com" + url
+    if not url or url.startswith("/"):
+        base = pick("baseUrl")
+        url = (base.rstrip("/") + "/" + url.lstrip("/")) if base and url else url
+    jid = pick("id", "objectID", "jobId", "source_id", "key")
+    if not jid:
+        jid = hashlib.sha1((site + ":" + title + ":" + company).encode()).hexdigest()[:16]
+    posted = pick("posted_at", "created_at", "date", "publication_date", "firstPublishedAt", "updated_at")
+    if not posted and item.get("footerPlaceholderLabel"):
+        rel = str(item["footerPlaceholderLabel"]).lower()
+        posted = _relative_date(rel) or ""
+    desc = pick("description", "summary", "text_html", "content", "descriptionPlain", "description_markdown", "jobDescription")
+    if not desc and isinstance(item.get("description"), list):
+        desc = " ".join(str(x) for x in item["description"][:3])
+    comp = item.get("compensationTierSummary") or item.get("salaryRange") or item.get("salary") or ""
+    if isinstance(comp, dict):
+        comp = f"{comp.get('currency') or ''} {comp.get('min')}–{comp.get('max')} {comp.get('interval') or ''}".strip()
+    if not comp and "sal_placeholder" in locals() and sal_placeholder:
+        comp = sal_placeholder
+    row = _canon({}, f"aa/{site}/{op}", jid, url, title, company, loc,
+                 str(comp), "", "", "", None, "", posted, posted, bool(desc))
+    row["_desc"] = desc
+    return row
+
+
+def _aa_op_params(site, op, keywords, location):
+    """Map our keywords/location to the op's actual parameter names (from the
+    packaged site definition or the local learned store)."""
+    param_names = []
+    home = os.path.expanduser("~")
+    site_candidates = []
+    if AA_CLI:
+        site_candidates.append(os.path.join(os.path.dirname(AA_CLI), "..", "sites", site + ".json"))
+    site_candidates.append(os.path.join(home, ".api-anything", "sites", site + ".json"))
+    for site_path in site_candidates:
+        try:
+            with open(site_path, encoding="utf-8") as f:
+                site_def = json.load(f)
+            for o in site_def.get("operations", []):
+                if o.get("name") == op:
+                    param_names = [s.get("param") for s in o.get("slots", []) if s.get("param")]
+                    break
+            if param_names:
+                break
+        except Exception:
+            continue
+    params = {}
+    for p in param_names:
+        pl = p.lower()
+        if pl in ("query", "q", "keyword", "keywords", "search", "text") and keywords:
+            params[p] = keywords
+        elif pl in ("location", "loc", "l", "l1", "city", "place") and location:
+            params[p] = location
+    if not params and keywords:
+        params["query"] = keywords
+    return params
+
+
+def fetch_via_api_anything(source, keywords, location, limit):
+    """Generic source: `aa/<site>/<op>` — call any catalog op and map rows."""
+    parts = source.split("/")
+    if len(parts) < 3:
+        return [], f"source must be aa/<site>/<op>, got {source!r}"
+    site, op = parts[1], parts[2]
+    params = _aa_op_params(site, op, keywords, location)
+    res = api_anything_call(site, op, params)
+    # honor a single retry when the CLI asks for one (transient 406/5xx)
+    if not res.get("ok") and isinstance(res.get("nextCall"), dict) \
+            and res["nextCall"].get("action") == "retry":
+        ms = int(res.get("retry") or res["nextCall"].get("ms") or 1000) if str(res.get("retry")).isdigit() else 1000
+        time.sleep(min(ms / 1000.0, 5.0))
+        res = api_anything_call(site, op, params)
+    if not res.get("ok"):
+        return [], f"api-anything {site}/{op} failed: {res.get('class')}: {res.get('reason')}"
+    data = res.get("data") or []
+    if isinstance(data, dict):
+        data = data.get("itemListElement") or data.get("jobs") or data.get("result") or []
+    if not isinstance(data, list):
+        return [], "api-anything returned non-list data"
+    rows = [_aa_item_to_row(it, site, op, keywords, location) for it in data]
+    rows = [r for r in rows if r.get("title") or r.get("source_url")]
+    return rows[:limit], None
+
+
+def normalize_salary(text):
+    """Normalize a raw salary string into a readable band (INR/USD)."""
+    if not text:
+        return ""
+    t = str(text).replace(",", "").strip()
+    if not t:
+        return ""
+    # INR LPA / Lakh
+    m = re.search(r"₹?\s*(\d+(?:\.\d+)?)\s*(?:-|–|to)\s*₹?\s*(\d+(?:\.\d+)?)\s*(?:LPA|Lakh|L)", t, re.I)
+    if m:
+        return f"₹{m.group(1)}–{m.group(2)} LPA"
+    m = re.search(r"₹?\s*(\d+(?:\.\d+)?)\s*(?:LPA|Lakh|L)", t, re.I)
+    if m:
+        return f"₹{m.group(1)} LPA"
+    # USD K range / single
+    m = re.search(r"\$\s*(\d+(?:\.\d+)?)K\s*(?:-|–|to)\s*\$\s*(\d+(?:\.\d+)?)K", t, re.I)
+    if m:
+        return f"${m.group(1)}K–${m.group(2)}K"
+    m = re.search(r"\$\s*(\d+(?:\.\d+)?)K", t, re.I)
+    if m:
+        return f"${m.group(1)}K"
+    # generic two-number range with currency hint
+    m = re.search(r"([A-Z$£€₹]?)\s*(\d+(?:\.\d+)?)\s*(?:-|–|to)\s*([A-Z$£€₹]?)\s*(\d+(?:\.\d+)?)", t)
+    if m:
+        cur = m.group(1) or m.group(3) or "$"
+        return f"{cur}{m.group(2)}–{cur}{m.group(4)}"
+    return t[:80]
+
+
+def company_snapshot(source_url, source):
+    """Enrich a company row: board slug, board URL, open-role count (from cache)."""
+    snap = {"source_board": "", "board_url": "", "open_roles": None}
+    if not source_url:
+        return snap
+    slug = None
+    if source == "greenhouse":
+        m = re.search(r"boards\.greenhouse\.io/([^/?#]+)", source_url)
+        if m:
+            slug = m.group(1)
+            snap["board_url"] = f"https://boards.greenhouse.io/{slug}"
+    elif source == "ashby":
+        m = re.search(r"jobs\.ashbyhq\.com/([^/?#]+)", source_url)
+        if m:
+            slug = m.group(1)
+            snap["board_url"] = f"https://jobs.ashbyhq.com/{slug}"
+    elif source == "lever":
+        m = re.search(r"jobs\.lever\.co/([^/?#]+)", source_url)
+        if m:
+            slug = m.group(1)
+            snap["board_url"] = f"https://jobs.lever.co/{slug}"
+    if slug:
+        snap["source_board"] = slug
+        cached = cache_get(f"{source}:{slug}")
+        if isinstance(cached, list):
+            snap["open_roles"] = len(cached)
+    return snap
+
+
+def load_matches(ws_path, run_id=None):
+    """Read jobs.jsonl -> merged evaluated rows (surfaced fields attached)."""
+    events = []
+    with open(os.path.join(ws_path, "jobs.jsonl"), encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                events.append(json.loads(line))
+            except Exception:
+                continue
+    surfaced = {}
+    for e in events:
+        if e.get("event") == "surfaced":
+            key = (e.get("run_id"), e.get("source"), str(e.get("source_id")))
+            surfaced[key] = e
+    rows = []
+    for e in events:
+        if e.get("event") != "evaluated":
+            continue
+        if run_id and e.get("run_id") != run_id:
+            continue
+        key = (e.get("run_id"), e.get("source"), str(e.get("source_id")))
+        s = surfaced.get(key, {})
+        merged = dict(e)
+        for field in ("title", "company_name", "location_display", "salary_display",
+                      "source_url", "posted_at"):
+            if field not in merged and s.get(field) is not None:
+                merged[field] = s.get(field)
+        merged.setdefault("title", "")
+        merged.setdefault("company_name", "")
+        merged.setdefault("source_url", "")
+        merged.setdefault("location_display", "")
+        merged.setdefault("salary_display", "")
+        rows.append(merged)
+    return rows
+
+
+def dedup_matches(rows):
+    """Flag near-duplicate/repost postings within the result set (fuzzy title+company)."""
+    def norm(s):
+        return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+    def toks(title, company):
+        a = set(norm(title).split())
+        b = set(norm(company).split())
+        return a | b
+    for r in rows:
+        r["is_repost"] = False
+        r["repost_of"] = ""
+    groups = []
+    for r in rows:
+        key = (str(r.get("company_name", "")).strip().lower(),
+               frozenset(toks(r.get("title", ""), r.get("company_name", ""))))
+        placed = False
+        for g in groups:
+            gkey, grew_rows = g
+            if gkey[0] == key[0]:
+                overlap = len(gkey[1] & key[1])
+                union = len(gkey[1] | key[1])
+                if union and overlap / union >= 0.75:
+                    grew_rows.append(r)
+                    placed = True
+                    break
+        if not placed:
+            groups.append((key, [r]))
+    for g in groups:
+        first = g[1][0]
+        for r in g[1][1:]:
+            r["is_repost"] = True
+            r["repost_of"] = f"{first.get('source')}:{first.get('source_id')}"
+    return rows
+
+
+def cmd_export_matches():
+    ws = flag(sys.argv[2:], "--workspace") or os.path.expanduser("~/.job-search")
+    out = flag(sys.argv[2:], "--out") or ""
+    run_id = flag(sys.argv[2:], "--run-id")
+    fmt = flag(sys.argv[2:], "--format") or "csv"
+    if not out:
+        out = os.path.join(ws, "reports", f"matches-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.csv")
+    rows = dedup_matches(load_matches(ws, run_id))
+    header = ["source", "source_id", "title", "company", "company_board", "board_url",
+              "open_roles", "location_display", "salary_raw", "salary_normalized",
+              "posted_at", "relevant", "match", "needs_human_check", "dealbreakers",
+              "unknowns", "reasoning", "is_repost", "repost_of", "apply_url"]
+    data = []
+    for r in rows:
+        snap = company_snapshot(r.get("source_url"), r.get("source"))
+        salary = normalize_salary(r.get("salary_display") or "")
+        if not salary and r.get("description_markdown"):
+            salary = normalize_salary(r["description_markdown"][:800])
+        data.append([
+            r.get("source", ""), r.get("source_id", ""), r.get("title", ""),
+            r.get("company_name", ""), snap["source_board"], snap["board_url"],
+            snap["open_roles"] if snap["open_roles"] is not None else "",
+            r.get("location_display", ""), r.get("salary_display", "") or "", salary,
+            (r.get("posted_at") or "")[:10], r.get("relevant"), r.get("match"),
+            r.get("needs_human_check"), "; ".join(r.get("dealbreakers_hit", []) or []),
+            "; ".join(r.get("unknowns", []) or []), r.get("reasoning", ""),
+            r.get("is_repost"), r.get("repost_of"), r.get("source_url", ""),
+        ])
+    if fmt == "xlsx":
+        try:
+            from openpyxl import Workbook
+        except Exception:
+            print("openpyxl not installed; writing CSV instead")
+            fmt = "csv"
+    if fmt == "xlsx":
+        from openpyxl import Workbook
+        wb = Workbook(); ws0 = wb.active; ws0.title = "matches"
+        ws0.append(header)
+        for row in data:
+            ws0.append(row)
+        wb.save(out)
+    else:
+        with open(out, "w", encoding="utf-8", newline="") as f:
+            import csv
+            w = csv.writer(f)
+            w.writerow(header)
+            w.writerows(data)
+    print(f"exported {len(data)} matches -> {out}")
+
+
+def main(argv):
+    if not argv:
+        err("usage", "no command", False)
+    if argv[0] == "--version":
+        print(VERSION)
+        sys.exit(0)
+    if argv[0] == "whoami":
+        cmd_whoami()
+    if argv[0] == "docs":
+        listing = argv[1] if len(argv) > 1 else LISTING
+        cmd_docs(listing)
+    if argv[0] == "probe-registry":
+        cmd_probe_registry()
+        sys.exit(0)
+    if argv[0] == "discover-slugs":
+        cmd_discover_slugs()
+        sys.exit(0)
+    if argv[0] == "export-matches":
+        cmd_export_matches()
+        sys.exit(0)
+    if argv[0] == "report":
+        cmd_report()
+        sys.exit(0)
+    if argv[0] == "call":
+        if len(argv) < 3:
+            err("usage", "call LISTING ROUTE [args]", False)
+        listing = argv[1]
+        slug = argv[2]
+        rest = argv[3:]
+        if slug == "search-jobs":
+            cmd_search(rest, listing)
+        if slug == "get-posting":
+            cmd_get_posting(rest, listing)
+        err("unsupported", f"unhandled route: {slug}", False)
+    err("unsupported", f"unhandled args: {argv}", False)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

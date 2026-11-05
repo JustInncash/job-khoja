@@ -1,0 +1,31 @@
+# The CI gate is the shell-script tests, the workspace validator's self-tests, and the three
+# repo linters below. Nothing is generated into skills/, so there is no build step to check.
+# How the skills behave is graded by live behavior evals the maintainer runs against the real
+# Job Postings API before a release. Those spawn real `claude -p` sessions and spend metered
+# calls, so they never run here.
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - name: Install test dependencies
+        run: python3 -m pip install pytest
+      - name: Tests (mechanics scripts, workspace validator)
+        run: python3 -m pytest -q
+      - name: Philosophy guard
+        run: python3 scripts/philosophy_guard.py --root .
+      - name: Doc lint (knowledge base)
+        run: python3 scripts/doc_lint.py --root .
+      - name: Release integrity
+        run: |
+          python3 scripts/check_release_integrity.py --root . --check-version-sync
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            python3 scripts/check_release_integrity.py --root . --check-version-bump --base "${{ github.event.pull_request.base.sha }}"
+          fi

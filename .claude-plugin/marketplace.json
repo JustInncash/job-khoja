@@ -1,0 +1,13 @@
+{
+  "name": "agent-data",
+  "owner": { "name": "agent-data" },
+  "description": "Job Search — Claude Code as your job-search assistant.",
+  "plugins": [
+    {
+      "name": "job-search",
+      "source": ".",
+      "description": "Define your preferences and start your first job search with /job-search.",
+      "category": "productivity"
+    }
+  ]
+}

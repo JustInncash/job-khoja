@@ -39,11 +39,23 @@ first:
 
 Read the route list once with `agent-data docs <listing id>`, which is free, and take every
 parameter name from it. One `search-jobs` call reaches one source, so each enabled query runs once
-per entry in `search.sources`: keywords, location and `limit` from the query, `source` from the
-list, `search.freshness` as the cutoff parameter the route docs name — that parameter takes an ISO
-date, so send the day the window reaches back to, today in UTC minus the window (the `any` window
-sends none). This pass reads those first pages and stops there — a continuation page holds what the next
-run finds new.
+per entry in `search.sources`, and each enabled source runs once per enabled query — a fresh run is
+`enabled queries × enabled sources` first-page calls.
+
+For a fresher QA shortlist the advised shape is `search.sources: [linkedin, remoteok, weworkremotely]`
+with five curated fresher query ids (qa-india, qa-fresher-selenium, qa-trainee-associate,
+qa-software-tester, qa-kolkata) so every candidate is surfaced through the three reach points a fresher
+job sits behind: the professional network, the remote/job-board aggregators, and the mobility/startup
+boards. The route docs name the full list (linkedin | remoteok | weworkremotely | ashby |
+greenhouse | lever); add ashby/greenhouse/lever for company-board search only. See
+`skills/job-search/templates/config.example.yaml` for a ready-to-use config with these five queries and
+the three sources enabled.
+
+One `search-jobs` call reaches one source, so each enabled query runs once per entry in `search.sources`: keywords,
+location and `limit` from the query, `source` from the list, `search.freshness` as the cutoff parameter the route
+docs name — that parameter takes an ISO date, so send the day the window reaches back to, today in UTC minus the
+window (the `any` window sends none). This pass reads those first pages and stops there — a continuation page holds
+what the next run finds new.
 
 Run each search with this skill's `scripts/search-jobs.sh --query-id <the query's id> --source <the
 source you asked for> -- <the route's own parameters, every value in single quotes>`. Everything

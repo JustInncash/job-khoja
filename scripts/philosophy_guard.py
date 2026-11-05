@@ -2,7 +2,7 @@
 """Guard the philosophy of SHIPPED default-output artifacts.
 
 Reject numeric fit-score math, budget/credit/cost config controls, and unverified claims
-about an actual charge. Accurate calls-first usage with a labeled pay-as-you-go equivalent
+about an actual charge. Accurate calls-first usage with a labeled no-billing equivalent
 is allowed, as is salary display text. Honored-on-request scores live only in chat, never in
 committed artifacts — so this scans the shipped examples and the copyable templates, not user
 conversations or prose that defines the philosophy.

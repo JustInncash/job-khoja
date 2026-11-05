@@ -84,10 +84,7 @@ These features live **only in this project** — the engine is fully local.
 
 ## Known constraints (honest)
 
-- LinkedIn access uses the guest endpoint; if LinkedIn tightens bot-blocking,
-  the engine returns a clean error and the run closes normally — the workflow
-  never fakes data.
-- The metered original indexes more LinkedIn results and more ATS boards than
-  any free client can enumerate. Judgment quality and workflow are identical;
-  breadth is a function of `engine/sources.json` + LinkedIn page depth
-  (`MAX_LINKEDIN_PAGES`).
+- The engine's breadth is a function of `engine/sources.json` + LinkedIn page depth
+  (`MAX_LINKEDIN_PAGES`); LinkedIn access uses the guest endpoint, and if LinkedIn
+  tightens bot-blocking, the engine returns a clean error and the run closes
+  normally — the workflow never fakes data.

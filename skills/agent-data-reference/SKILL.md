@@ -8,10 +8,9 @@ description: "Not user-facing; job-search-agent takes user questions. What the j
 
 One marketplace listing serves four job sources. Searching and reading postings go through two
 scripts in the `job-search-run` skill; the ONLY agent-data commands to call directly are the three
-in the table below. The appendix at the end covers the one case where a metered route is
-called without its script. This file carries what the route docs leave out: the per-source
-behavior that changes a query or a judgment, what each call costs, and what to tell the user
-before spending one. Route shapes here were read from `agent-data docs` on 2026-07-31.
+in the table below. This file carries what the route docs leave out: the per-source
+behavior that changes a query or a judgment, what each call does, and what to tell the user
+before making one. Route shapes here were read from `agent-data docs` on 2026-07-31.
 
 ## Direct agent-data commands
 
@@ -58,9 +57,9 @@ script.
 | `salary_display` is free text on every source and arrives as raw HTML on some lever rows; `employment_type` comes back as FULL_TIME, FullTime, or Full-time depending on the source | Strip any markup from `salary_display` and quote the remaining text as written; read `employment_type` as text, since its casing differs per source |
 | A detail read returns `missing_fields[]`, naming what the page did not yield | Report each as a detail the posting leaves unstated |
 | `source_url` on ashby, greenhouse, and lever is the live apply page; LinkedIn's carries tracking params | Link it as where the user applies |
-| The `status` route bills a metered call, and what it reports is one global health number rather than per-source readiness | `whoami` answers the preflight question (`api_key_set`) locally and free, which is what a run needs before its first search |
-| The free tier includes 100 calls a month; once it is spent the API answers `403 insufficient_credits`, and that rejected call is unmetered | Stop metered work and tell the user the allowance has been reached, so this run cannot continue until calls are available; their saved matches are unaffected, and their account at https://agent-data.motie.dev/settings/billing is where to check |
-| The route docs offer `--fields` on both routes to trim the response, and `record-api-response.sh` refuses a body whose rows or posting are missing `source` or `source_id` — a trimmed search page loses every row of a metered call, and a trimmed posting is read again, and billed again. Trimming saves little: measured 2026-08-12, `--fields id,title,company_name` returned 214 bytes against 7,645 for the same posting unfiltered, and nearly all of a posting's bytes are the description and the salary text, which a reader needs | VERY IMPORTANT: DO NOT send `--fields`, on either route, through the wrappers or without them |
+| The `status` route reports one global health number rather than per-source readiness | `whoami` answers the preflight question (`api_key_set`) locally, which is what a run needs before its first search |
+| The engine has no quota: `403 insufficient_credits` can never occur | Runs never stop for an allowance; every call is free and local |
+| The route docs offer `--fields` on both routes to trim the response, and `record-api-response.sh` refuses a body whose rows or posting are missing `source` or `source_id` — a trimmed search page loses every row of a call, and a trimmed posting is read again. Trimming saves little: measured 2026-08-12, `--fields id,title,company_name` returned 214 bytes against 7,645 for the same posting unfiltered, and nearly all of a posting's bytes are the description and the salary text, which a reader needs | VERY IMPORTANT: DO NOT send `--fields`, on either route, through the wrappers or without them |
 
 ## When a call fails
 
@@ -84,25 +83,23 @@ others going; for detail reads, judge that source's remaining postings from thei
 
 ## What a run spends
 
-Past the free tier, agent-data's rates as verified on 2026-07-15:
+The job-khoja engine is local and free: no metered API, no quota, no billing.
+A run's call ledger still records every search and detail read, so you can see
+exactly how many operations a run performed.
 
-| Plan | Included metered calls | Effective rate |
-|---|---|---|
-| pay-as-you-go | purchased as needed | $0.008 per metered call; $5 adds 625 calls |
-| $30 a month | 4,000 a month | $0.0075 per call at full use |
-| $100 a month | 15,000 a month | about $0.0067 per call at full use |
-| $200 a month | 40,000 a month | $0.005 per call at full use |
-
-Count calls. Multiplying a call count by one of these rates produces an estimate; what the user
-was actually billed comes from live account data.
+| Metric | Value |
+|---|---|
+| Engine | local (`engine/agent-data`, `1.0.0-local`) |
+| API key | none required |
+| Cost | free, unlimited |
 
 `B = enabled queries × enabled sources` is the first-page cost of one run. B is the floor —
-continuation pages, detail reads, and metered failures and retries land on top of it.
+continuation pages, detail reads, and transient failures and retries land on top of it.
 
-Before the first metered call of a session, tell the user in your own words, in a sentence or two:
-how many calls this run opens with (B), that agent-data includes 100 calls a month at no charge,
-and that reading promising postings adds calls. Lead with the call count and follow it with the
-free tier, so the user can see how big this run is against the month's allowance.
+Before the first call of a session, tell the user in your own words, in a sentence or two:
+how many calls this run opens with (B), that the engine is free and local with no monthly cap,
+and that reading promising postings adds calls. Lead with the call count so the user can see how
+big this run is.
 
 Detail reads are where the number grows, and the summary scan is what keeps them few: judge from
 titles and summary rows first, then read full text only for the postings that survive that pass.

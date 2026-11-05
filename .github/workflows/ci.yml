@@ -1,8 +1,7 @@
 # The CI gate is the shell-script tests, the workspace validator's self-tests, and the three
 # repo linters below. Nothing is generated into skills/, so there is no build step to check.
-# How the skills behave is graded by live behavior evals the maintainer runs against the real
-# Job Postings API before a release. Those spawn real `claude -p` sessions and spend metered
-# calls, so they never run here.
+# How the skills behave is graded by live behavior evals the maintainer runs against the
+# job engines before a release. Those spawn real `claude -p` sessions, so they never run here.
 name: ci
 on:
   push: { branches: [main] }

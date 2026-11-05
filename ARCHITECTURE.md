@@ -141,9 +141,9 @@ linter, the philosophy guard, the release-integrity checks, the mechanics script
 the shims' self-checks), plus a fake `agent-data` PATH shim (`tests/fake-agent-data`) so a whole run is
 exercised with no network and no credits. Scenario suites in the five user-facing skills, at `skills/<skill>/evals/evals.json`,
 checked for structural coherence by [scripts/eval_harness.py](scripts/eval_harness.py) and driven through
-the skill-creator skill. On top of those, the maintainer runs a set of live behavior evals against the
-real Job Postings API before tagging a release: each spawns a real session and a grader reads the
-transcript and the workspace it produced. They spend metered calls, so they are a local release gate
+the skill-creator skill. On top of those, the maintainer runs a set of live behavior evals before
+tagging a release: each spawns a real session and a grader reads the
+transcript and the workspace it produced. They are a local release gate
 rather than a CI step, and they are not in this repository.
 
 ## Package layering & data flow
@@ -165,7 +165,7 @@ every skill can reach the two reference skills; the contracts are identical acro
 Install steps are in [README.md](README.md).
 
 **Headless run flow.** A scheduled pass runs [job-search-run](skills/job-search-run/SKILL.md): free preflight
-gates (CLI present, config, auth, brief, service status), then one metered search per enabled query. Every
+gates (CLI present, config, auth, brief, service status), then one search per enabled query. Every
 response goes through `record-api-response.sh`, which appends the events it implies and drops the rows a run
 has already judged. The summary scan judges every row it can judge from the row itself, through
 `record-judgment.sh`, and puts every other row on the read list with `queue-detail-read.sh`.

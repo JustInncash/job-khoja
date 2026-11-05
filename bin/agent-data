@@ -1,5 +1,5 @@
 #!/bin/sh
-# agent-data launcher (unlimited edition) — points at this repo's engine,
+# agent-data launcher — points at this repo's engine,
 # resolved relative to the launcher's own location.
 DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 exec python3 "$DIR/../engine/agent-data" "$@"

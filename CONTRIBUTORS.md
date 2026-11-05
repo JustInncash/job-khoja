@@ -1,6 +1,6 @@
 # Contributors
 
-- **JustInncash** — Subhankar Patra (primary author)
-- **JustInCasesss** — Subhankar (co-author, QA/web dev)
+- primary author
+- co-author, QA / web development
 
 Thanks for using the job-khoja. Contributions are welcome — see CONTRIBUTING.md.

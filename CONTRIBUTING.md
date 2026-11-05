@@ -88,7 +88,7 @@ is billed. Keep them that way: if you add a skill or a code path that talks to `
 scenario through the shim rather than the live CLI.
 
 Beyond those, the maintainer runs a set of live behavior evals against the real Job Postings API
-before tagging a release. Each spawns a real session and spends metered calls, so they are not in
+before tagging a release. Each spawns a real session and spends real calls, so they are not in
 this repository and a contributor does not run them.
 
 If a test or eval fails, fix it (or update it deliberately, explaining why in the PR) before requesting
@@ -152,7 +152,7 @@ brief, `config.yaml`, or `jobs.jsonl`. Keep them intact:
   / strong*, with reasoning. No 0–100 fit scores, no category weights, no per-criterion points. Importance
   lives in which bucket a preference sits in.
 - **Usage context, not budget controls.** Users choose outcomes — frequency, sources, and review depth — and
-  see exact usage context before added metered work plus actual calls after each run. Accurate calls-first
+  see exact usage context before added work plus actual calls after each run. Accurate calls-first
   context is expected; a `budget`, `credits`, or `cost` config field, hard monetary cap, or invented actual
   charge is not. Pricing and metering facts live only in the `agent-data-reference` skill.
 - **Private and local.** The user workspace is private PII with a deny-all `.gitignore` and is never
@@ -165,6 +165,6 @@ brief, `config.yaml`, or `jobs.jsonl`. Keep them intact:
   fails.
 
 If a change would add a score, a weight, or a monetary budget control, it's almost certainly the wrong
-direction — open an issue to discuss first. When a choice changes metered work, give accurate calls-first
+direction — open an issue to discuss first. When a choice changes work, give accurate calls-first
 context and point account-specific billing questions to the canonical agent-data sources instead of hiding
 usage or inventing a charge.

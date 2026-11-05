@@ -42,7 +42,7 @@ per-criterion points reach shipped output.
 
 Users control outcomes they understand — how often the search runs, which sources it covers, and
 how deeply it reviews company boards — rather than setting a monetary budget. Before a choice can
-add metered work, the agent gives the exact known call baseline and names what remains uncertain;
+add work, the agent gives the exact known call baseline and names what remains uncertain;
 after every run, it reports actual calls first. Accurate, clearly labeled usage context is expected,
 but a `budget`, `credits`, or `cost` config field and a hard monetary cap are not. Canonical pricing
 and metering facts live in

@@ -107,12 +107,12 @@ digest carrying the cause and the fix, and the maintainer's live behavior evals.
 
 ## 3. Retry & circuit-breaker — patient, then it stops
 
-Upstream calls (the metered searches and detail fetches) can fail transiently, so the run
+Upstream calls (the searches and detail fetches) can fail transiently, so the run
 retries — but only the failures the contract marks **retryable**. The branch keys on the error
 envelope's `retryable` boolean, never on parsing the error code string: a transient upstream
 failure (the 502s) is retried with bounded exponential backoff and jitter; a deterministic
 client error (a bad field, an invalid request, a stale id/URL pair) is **never** retried,
-because retrying it would only waste a metered call and still fail. The exact attempt count,
+because retrying it would only waste a call and still fail. The exact attempt count,
 the backoff schedule, and which codes are retryable are owned by
 the `agent-data-reference` skill —
 paraphrased here, authoritative there.
@@ -125,9 +125,9 @@ summary-only judgment with a footnote and the run carries on. The strategy in on
 with transient failures, give up immediately on deterministic ones, and break the circuit when an
 upstream is clearly down.
 
-Usage accounting follows attempts, not just successful logical operations. Each completed metered
+Usage accounting follows attempts, not just successful logical operations. Each completed
 attempt is classified once; retries and charged failures remain diagnostic subsets, while free routes
-and a quota-rejected attempt stay outside the metered total. That same local ledger supplies the
+and a quota-rejected attempt stay outside the total. That same local ledger supplies the
 calls-first digest line and the exact prior-work count when quota stops a run, avoiding both double
 counting and an invented account charge. The canonical counting rules live in
 the `agent-data-reference` skill, and the
@@ -199,7 +199,7 @@ Reliability claims are only as good as their tests. Four layers back this system
 - **A credit-free fake `agent-data` shim** (a PATH shim under [../tests/](../tests/)) lets a
   whole run be driven with deterministic, injectable upstream behavior — a spent allowance, an
   outage, stale links, a degraded service, cursor chains, malformed pagination — with **no network
-  and no metered calls**, so the failure, progress, and retry paths in §2–§4 can be exercised
+  and no calls**, so the failure, progress, and retry paths in §2–§4 can be exercised
   repeatedly and for free.
 - **The live behavior evals** the maintainer runs check the *model's* behavior against the real
   API: each spawns a real session, captures the transcript and the workspace it produced, and a
@@ -214,7 +214,7 @@ Reliability claims are only as good as their tests. Four layers back this system
   local pre-PR step rather than a CI job.
 
 Honest scope (per [QUALITY_SCORE.md](QUALITY_SCORE.md)): both eval layers and the live acceptance
-pass run **outside CI**, because a behavior eval spends real metered calls against the live Job
+pass run **outside CI**, because a behavior eval spends real calls against the live Job
 Postings API. So CI proves the dev tooling, the file rules, and the docs; the release gate that
 proves runtime behavior is a local run of the behavior evals before tagging. That split is
 deliberate and tracked, not papered over. The green-gate commands and the contributor workflow are

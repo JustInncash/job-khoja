@@ -30,7 +30,7 @@ escape hatch: it works, but skills never require it or guide users toward it by 
 Review depth uses the same conversational surface. “Review up to 50 new postings this run” is a
 one-off finite request; “review up to 50 every run” is saved; ambiguous “scan everything” defaults
 to one run and says so. Enabling or increasing depth first shows the known calls and uncertain
-additions, then asks for explicit confirmation before a metered run or config write. A confirmed
+additions, then asks for explicit confirmation before a run or config write. A confirmed
 saved setting is durable consent for later headless runs; reductions and a return to normal first-
 page coverage take effect immediately.
 
@@ -98,7 +98,7 @@ Each run writes a Markdown digest to `reports/<date>-digest.md`. The digest is t
 artifact the user reads: it groups postings by match strength, states the run-health,
 includes a counts line and a calls-first usage summary, and gives a one-line reason for every
 shown match so the user can audit why it landed in its band. Any account-neutral dollar context
-is labeled as a pay-as-you-go equivalent, not an actual charge. Footnotes cover stale detail
+is labeled as an equivalent, not an actual charge. Footnotes cover stale detail
 links, incomplete deeper coverage, partial failures, and a brief-age nudge when applicable.
 
 The **exact digest format** (section layout, counts line shape, run-health vocabulary,

@@ -8,10 +8,21 @@ description: Set up, check on, and steer the user's job search — the front doo
 The front door: first-time setup, the home view after that, and where the user steers their search
 from by talking to you. The work belongs to the other skills — `job-search-run` pulls and judges
 postings, `job-preference-interview` writes the brief, `evaluate-job-fit` judges one posting. Two
-more skills carry the mechanics — invoke each as you need it:
+more skills carry the mechanics — invoke each as you need it.
 
-- `job-search-runbook` — the workspace, what each file in it holds, the run contract.
-- `agent-data-reference` — the CLI, what a call costs, what to say before spending one.
+## Privacy and verification
+
+These standing rules apply to every job-search run, before anything else:
+
+- Verify files by reading them back from disk. This chat and the terminal can mask phone digits
+  or truncate text, so a masked or missing line in display does not mean it is absent.
+- Never commit personal information to a shared repo — real names, GitHub handles, phone numbers,
+  emails, dates of birth, or anything that names the user. Prefer generic role entries in
+  CONTRIBUTORS and a privacy-guard line in CONTRIBUTING.
+- Redact secrets before any summary or commit: API keys, tokens, passwords, and connection
+  strings become `[REDACTED]`; only the file on disk is authoritative.
+- Learn each run's own numbers from the workspace (posting-counts.sh, the newest runs/<id>.json,
+  the digest) — do not trust a count that was only echoed to this chat.
 
 ## Your first message on a first run
 

@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""agent-data-local — a free, keyless, unlimited drop-in replacement for the
-metered `agent-data` CLI used by the job-search plugin.
+"""agent-data — the job-khoja engine: a free, keyless, unlimited local CLI.
 
-Same CLI verbs and JSON envelopes as the real CLI, so the plugin's wrapper
+Speaks a stable set of CLI verbs and JSON envelopes, so the plugin's wrapper
 scripts (search-jobs.sh / fetch-posting.sh) and record-api-response.sh work
 unchanged. No API keys, no billing, no monthly cap.
 
